@@ -13,6 +13,8 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.view.Display
@@ -33,11 +35,18 @@ import org.opencv.core.Core
 import org.opencv.core.Core.ROTATE_90_CLOCKWISE
 import org.opencv.core.CvType
 import org.opencv.core.Mat
+import org.opencv.core.MatOfByte
 import org.opencv.core.Size
 import org.opencv.imgcodecs.Imgcodecs
 import org.opencv.imgproc.Imgproc
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
+import java.nio.ByteBuffer
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.max
@@ -61,6 +70,16 @@ class ScanPresenter constructor(
 
     private var mLastClickTime = 0L
     private var shutted: Boolean = true
+    
+    // Aggiungiamo un handler e runnable per il timeout dell'acquisizione dell'immagine
+    private val pictureTimeoutHandler = Handler(Looper.getMainLooper())
+    private val pictureTimeoutRunnable = Runnable {
+        Log.e(TAG, "Picture taking timed out")
+        showError("Timeout durante l'acquisizione dell'immagine")
+        releaseCamera()
+        shutted = true
+        busy = false
+    }
 
     init {
         mSurfaceHolder.addCallback(this)
@@ -97,12 +116,22 @@ class ScanPresenter constructor(
         shutted = false
         Log.i(TAG, "try to focus")
 
-        mCamera?.autoFocus { b, _ ->
-            Log.i(TAG, "focus result: $b")
-            mCamera?.enableShutterSound(false)
-            mCamera?.takePicture(null, null, this)
+        try {
+            mCamera?.autoFocus { b, _ ->
+                Log.i(TAG, "focus result: $b")
+                mCamera?.enableShutterSound(false)
+                
+                // Impostiamo un timeout di 10 secondi per l'acquisizione dell'immagine
+                pictureTimeoutHandler.postDelayed(pictureTimeoutRunnable, 10000)
+                
+                mCamera?.takePicture(null, null, this)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error taking picture: ${e.message}", e)
+            showError("Impossibile acquisire l'immagine")
+            shutted = true
+            busy = false
         }
-
     }
 
     fun toggleFlash() {
@@ -152,7 +181,6 @@ class ScanPresenter constructor(
     }
 
     private fun initCamera() {
-
         try {
             mCamera = Camera.open(Camera.CameraInfo.CAMERA_FACING_BACK)
         } catch (e: RuntimeException) {
@@ -244,6 +272,7 @@ class ScanPresenter constructor(
             copied
         }
     }
+    
     fun detectEdge(pic: Mat) {
         Log.i("height", pic.size().height.toString())
         Log.i("width", pic.size().width.toString())
@@ -266,34 +295,168 @@ class ScanPresenter constructor(
 
     override fun surfaceDestroyed(p0: SurfaceHolder) {
         synchronized(this) {
+            releaseCamera()
+        }
+    }
+    
+    // Metodo di supporto per mostrare errori all'utente
+    private fun showError(message: String) {
+        Log.e(TAG, "Errore: $message")
+        (context as? Activity)?.runOnUiThread {
+            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+        }
+    }
+    
+    // Metodo per rilasciare le risorse della fotocamera in modo sicuro
+    private fun releaseCamera() {
+        try {
             mCamera?.stopPreview()
             mCamera?.setPreviewCallback(null)
             mCamera?.release()
             mCamera = null
+        } catch (e: Exception) {
+            Log.e(TAG, "Error releasing camera: ${e.message}", e)
         }
     }
+    
+    // Metodo helper per creare un file temporaneo
+    private fun createImageFile(): File {
+        val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+        val imageFileName = "JPEG_$timeStamp"
+        val storageDir = context.getExternalFilesDir("Pictures")
+        return File.createTempFile(imageFileName, ".jpg", storageDir)
+    }
 
+    /**
+     * Metodo corretto per gestire l'acquisizione dell'immagine
+     * Risolve il problema di decodifica con OpenCV 4.11.0
+     */
     override fun onPictureTaken(p0: ByteArray?, p1: Camera?) {
+        // Rimuovi il timeout
+        pictureTimeoutHandler.removeCallbacks(pictureTimeoutRunnable)
+        
         Log.i(TAG, "on picture taken")
-        Observable.just(p0)
-            .subscribeOn(proxySchedule)
-            .subscribe {
-                val pictureSize = p1?.parameters?.pictureSize
-                Log.i(TAG, "picture size: " + pictureSize.toString())
-                val mat = Mat(
-                    Size(
-                        pictureSize?.width?.toDouble() ?: 1920.toDouble(),
-                        pictureSize?.height?.toDouble() ?: 1080.toDouble()
-                    ), CvType.CV_8U
-                )
-                mat.put(0, 0, p0)
-                val pic = Imgcodecs.imdecode(mat, Imgcodecs.CV_LOAD_IMAGE_UNCHANGED)
-                Core.rotate(pic, pic, Core.ROTATE_90_CLOCKWISE)
-                mat.release()
-                detectEdge(pic)
+        
+        // Verifica che i dati dell'immagine non siano null o vuoti
+        if (p0 == null || p0.isEmpty()) {
+            Log.e(TAG, "Immagine acquisita vuota o nulla")
+            showError("Immagine non valida, riprovare")
+            shutted = true
+            busy = false
+            return
+        }
+        
+        Log.d(TAG, "Dati immagine ricevuti: ${p0.size} bytes")
+        
+        Observable.create<Unit> { emitter ->
+            try {
+                // Salviamo i dati grezzi dell'immagine su file
+                // Questa è un'operazione più sicura rispetto alla decodifica diretta
+                val pictureFile = createImageFile()
+                FileOutputStream(pictureFile).use { fos ->
+                    fos.write(p0)
+                    fos.flush()
+                }
+                
+                Log.i(TAG, "Raw image data saved to: ${pictureFile.absolutePath}")
+                
+                // Opzione 1: Utilizzo più sicuro di MatOfByte
+                try {
+                    val matOfByte = MatOfByte(*p0)
+                    val pic = Imgcodecs.imdecode(matOfByte, Imgcodecs.CV_LOAD_IMAGE_UNCHANGED)
+                    
+                    if (!pic.empty()) {
+                        Log.i(TAG, "Immagine decodificata con successo usando MatOfByte")
+                        
+                        // Ruota l'immagine
+                        Core.rotate(pic, pic, Core.ROTATE_90_CLOCKWISE)
+                        matOfByte.release()
+                        
+                        // Rileva i bordi e procedi
+                        detectEdge(pic)
+                        emitter.onNext(Unit)
+                        emitter.onComplete()
+                        return@create
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Errore durante la decodifica con MatOfByte: ${e.message}", e)
+                    // Continuiamo con il metodo alternativo
+                }
+                
+                // Opzione 2: Carica l'immagine dal file salvato
+                try {
+                    val pic = Imgcodecs.imread(pictureFile.absolutePath)
+                    
+                    if (!pic.empty()) {
+                        Log.i(TAG, "Immagine caricata con successo dal file")
+                        
+                        // Ruota l'immagine
+                        Core.rotate(pic, pic, Core.ROTATE_90_CLOCKWISE)
+                        
+                        // Rileva i bordi e procedi
+                        detectEdge(pic)
+                        emitter.onNext(Unit)
+                        emitter.onComplete()
+                        return@create
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Errore durante il caricamento dal file: ${e.message}", e)
+                    // Continuiamo con il metodo alternativo
+                }
+                
+                // Opzione 3: Utilizzo di ByteBuffer con Mat
+                try {
+                    val buffer = ByteBuffer.allocateDirect(p0.size)
+                    buffer.put(p0)
+                    buffer.position(0)
+                    
+                    val mat = Mat(1, p0.size, CvType.CV_8UC1)
+                    mat.put(0, 0, p0)
+                    
+                    val pic = Imgcodecs.imdecode(mat, Imgcodecs.CV_LOAD_IMAGE_UNCHANGED)
+                    mat.release()
+                    
+                    if (!pic.empty()) {
+                        Log.i(TAG, "Immagine decodificata con successo usando ByteBuffer")
+                        
+                        // Ruota l'immagine
+                        Core.rotate(pic, pic, Core.ROTATE_90_CLOCKWISE)
+                        
+                        // Rileva i bordi e procedi
+                        detectEdge(pic)
+                        emitter.onNext(Unit)
+                        emitter.onComplete()
+                        return@create
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Errore durante la decodifica con ByteBuffer: ${e.message}", e)
+                }
+                
+                // Se tutti i metodi falliscono, lanciamo un errore
+                throw IOException("Impossibile decodificare l'immagine con nessun metodo")
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Errore durante l'elaborazione dell'immagine", e)
+                emitter.onError(e)
+            }
+        }
+        .subscribeOn(proxySchedule)
+        .observeOn(AndroidSchedulers.mainThread())
+        .subscribe(
+            // Successo
+            {
+                Log.d(TAG, "Immagine elaborata con successo")
+                shutted = true
+                busy = false
+            },
+            // Errore
+            { error ->
+                Log.e(TAG, "Errore nell'elaborazione dell'immagine", error)
+                showError("Impossibile elaborare l'immagine: ${error.localizedMessage ?: "Errore sconosciuto"}")
                 shutted = true
                 busy = false
             }
+        )
     }
 
     override fun onPreviewFrame(p0: ByteArray?, p1: Camera?) {
@@ -346,7 +509,6 @@ class ScanPresenter constructor(
         } catch (e: Exception) {
             print(e.message)
         }
-
     }
 
     /** [CameraCharacteristics] corresponding to the provided Camera ID */
