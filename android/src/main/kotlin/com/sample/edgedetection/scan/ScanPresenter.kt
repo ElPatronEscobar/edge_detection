@@ -3,6 +3,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Point
 import android.graphics.Rect
@@ -20,7 +21,7 @@ import android.util.Log
 import android.view.Display
 import android.view.SurfaceHolder
 import android.widget.Toast
-import com.sample.edgedetection.EdgeDetectionHandler
+import com.sample.edgedetection.EdgeDetectionPlugin
 import com.sample.edgedetection.REQUEST_CODE
 import com.sample.edgedetection.SourceManager
 import com.sample.edgedetection.crop.CropActivity
@@ -181,73 +182,92 @@ class ScanPresenter constructor(
     }
 
     private fun initCamera() {
+        // Tentiamo prima la fotocamera posteriore, se fallisce proviamo quella frontale
         try {
+            Log.i(TAG, "Tentativo di aprire la fotocamera posteriore")
             mCamera = Camera.open(Camera.CameraInfo.CAMERA_FACING_BACK)
         } catch (e: RuntimeException) {
-            e.stackTrace
-            Toast.makeText(context, "cannot open camera, please grant camera", Toast.LENGTH_SHORT)
-                .show()
-            return
+            Log.e(TAG, "Errore nell'apertura della fotocamera posteriore: ${e.message}")
+            
+            try {
+                // Prova con la fotocamera frontale come fallback
+                Log.i(TAG, "Tentativo di aprire la fotocamera frontale")
+                mCamera = Camera.open(Camera.CameraInfo.CAMERA_FACING_FRONT)
+            } catch (e2: RuntimeException) {
+                Log.e(TAG, "Errore nell'apertura della fotocamera frontale: ${e2.message}")
+                e2.stackTrace
+                Toast.makeText(context, "cannot open camera, please grant camera", Toast.LENGTH_SHORT)
+                    .show()
+                return
+            }
         }
 
-        val cameraCharacteristics =
-            cameraManager.getCameraCharacteristics(getBackFacingCameraId()!!)
+        try {
+            val cameraCharacteristics =
+                cameraManager.getCameraCharacteristics(getBackFacingCameraId()!!)
 
-        val size = iView.getCurrentDisplay()?.let {
-            getPreviewOutputSize(
-                it, cameraCharacteristics, SurfaceHolder::class.java
-            )
+            val size = iView.getCurrentDisplay()?.let {
+                getPreviewOutputSize(
+                    it, cameraCharacteristics, SurfaceHolder::class.java
+                )
+            }
+
+            Log.i(TAG, "Selected preview size: ${size?.width}${size?.height}")
+
+            size?.width?.toString()?.let { Log.i(TAG, it) }
+            val param = mCamera?.parameters
+            param?.setPreviewSize(size?.width ?: 1920, size?.height ?: 1080)
+            val display = iView.getCurrentDisplay()
+            val point = Point()
+
+            display?.getRealSize(point)
+
+            val displayWidth = minOf(point.x, point.y)
+            val displayHeight = maxOf(point.x, point.y)
+            val displayRatio = displayWidth.div(displayHeight.toFloat())
+            val previewRatio = size?.height?.toFloat()?.div(size.width.toFloat()) ?: displayRatio
+            if (displayRatio > previewRatio) {
+                val surfaceParams = iView.getSurfaceView().layoutParams
+                surfaceParams.height = (displayHeight / displayRatio * previewRatio).toInt()
+                iView.getSurfaceView().layoutParams = surfaceParams
+            }
+
+            val supportPicSize = mCamera?.parameters?.supportedPictureSizes
+            supportPicSize?.sortByDescending { it.width.times(it.height) }
+            var pictureSize = supportPicSize?.find {
+                it.height.toFloat().div(it.width.toFloat()) - previewRatio < 0.01
+            }
+
+            if (null == pictureSize) {
+                pictureSize = supportPicSize?.get(0)
+            }
+
+            if (null == pictureSize) {
+                Log.e(TAG, "can not get picture size")
+            } else {
+                param?.setPictureSize(pictureSize.width, pictureSize.height)
+            }
+            val pm = context.packageManager
+            if (pm.hasSystemFeature(PackageManager.FEATURE_CAMERA_AUTOFOCUS) && mCamera!!.parameters.supportedFocusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE))
+            {
+                param?.focusMode = Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE
+                Log.i(TAG, "enabling autofocus")
+            } else {
+                Log.i(TAG, "autofocus not available")
+            }
+
+            param?.flashMode = Camera.Parameters.FLASH_MODE_OFF
+
+            mCamera?.parameters = param
+            mCamera?.setDisplayOrientation(90)
+            mCamera?.enableShutterSound(false)
+        } catch (e: Exception) {
+            Log.e(TAG, "Errore nella configurazione della fotocamera: ${e.message}")
+            e.printStackTrace()
+            
+            // Assicuriamoci di rilasciare la fotocamera in caso di errore
+            releaseCamera()
         }
-
-        Log.i(TAG, "Selected preview size: ${size?.width}${size?.height}")
-
-        size?.width?.toString()?.let { Log.i(TAG, it) }
-        val param = mCamera?.parameters
-        param?.setPreviewSize(size?.width ?: 1920, size?.height ?: 1080)
-        val display = iView.getCurrentDisplay()
-        val point = Point()
-
-        display?.getRealSize(point)
-
-        val displayWidth = minOf(point.x, point.y)
-        val displayHeight = maxOf(point.x, point.y)
-        val displayRatio = displayWidth.div(displayHeight.toFloat())
-        val previewRatio = size?.height?.toFloat()?.div(size.width.toFloat()) ?: displayRatio
-        if (displayRatio > previewRatio) {
-            val surfaceParams = iView.getSurfaceView().layoutParams
-            surfaceParams.height = (displayHeight / displayRatio * previewRatio).toInt()
-            iView.getSurfaceView().layoutParams = surfaceParams
-        }
-
-        val supportPicSize = mCamera?.parameters?.supportedPictureSizes
-        supportPicSize?.sortByDescending { it.width.times(it.height) }
-        var pictureSize = supportPicSize?.find {
-            it.height.toFloat().div(it.width.toFloat()) - previewRatio < 0.01
-        }
-
-        if (null == pictureSize) {
-            pictureSize = supportPicSize?.get(0)
-        }
-
-        if (null == pictureSize) {
-            Log.e(TAG, "can not get picture size")
-        } else {
-            param?.setPictureSize(pictureSize.width, pictureSize.height)
-        }
-        val pm = context.packageManager
-        if (pm.hasSystemFeature(PackageManager.FEATURE_CAMERA_AUTOFOCUS) && mCamera!!.parameters.supportedFocusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE))
-        {
-            param?.focusMode = Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE
-            Log.i(TAG, "enabling autofocus")
-        } else {
-            Log.i(TAG, "autofocus not available")
-        }
-
-        param?.flashMode = Camera.Parameters.FLASH_MODE_OFF
-
-        mCamera?.parameters = param
-        mCamera?.setDisplayOrientation(90)
-        mCamera?.enableShutterSound(false)
     }
 
     private fun matrixResizer(sourceMatrix: Mat): Mat {
@@ -281,7 +301,7 @@ class ScanPresenter constructor(
         Imgproc.cvtColor(resizedMat, resizedMat, Imgproc.COLOR_RGB2BGRA)
         SourceManager.pic = resizedMat
         val cropIntent = Intent(context, CropActivity::class.java)
-        cropIntent.putExtra(EdgeDetectionHandler.INITIAL_BUNDLE, this.initialBundle)
+        cropIntent.putExtra(EdgeDetectionPlugin.INITIAL_BUNDLE, this.initialBundle)
         (context as Activity).startActivityForResult(cropIntent, REQUEST_CODE)
     }
 
@@ -328,16 +348,15 @@ class ScanPresenter constructor(
     }
 
     /**
-     * Metodo corretto per gestire l'acquisizione dell'immagine
-     * Risolve il problema di decodifica con OpenCV 4.11.0
+     * Approccio radicale che bypassa completamente il problema di OpenCV
+     * Usando le API Android native per salvare e processare l'immagine
      */
     override fun onPictureTaken(p0: ByteArray?, p1: Camera?) {
         // Rimuovi il timeout
         pictureTimeoutHandler.removeCallbacks(pictureTimeoutRunnable)
         
-        Log.i(TAG, "on picture taken")
+        Log.i(TAG, "##### USANDO LA VERSIONE RADICALE DEL METODO ONPICTURETAKEN #####")
         
-        // Verifica che i dati dell'immagine non siano null o vuoti
         if (p0 == null || p0.isEmpty()) {
             Log.e(TAG, "Immagine acquisita vuota o nulla")
             showError("Immagine non valida, riprovare")
@@ -350,93 +369,55 @@ class ScanPresenter constructor(
         
         Observable.create<Unit> { emitter ->
             try {
-                // Salviamo i dati grezzi dell'immagine su file
-                // Questa è un'operazione più sicura rispetto alla decodifica diretta
+                // Salva direttamente i dati dell'immagine in un file JPEG
                 val pictureFile = createImageFile()
-                FileOutputStream(pictureFile).use { fos ->
-                    fos.write(p0)
-                    fos.flush()
-                }
-                
-                Log.i(TAG, "Raw image data saved to: ${pictureFile.absolutePath}")
-                
-                // Opzione 1: Utilizzo più sicuro di MatOfByte
                 try {
-                    val matOfByte = MatOfByte(*p0)
-                    val pic = Imgcodecs.imdecode(matOfByte, Imgcodecs.CV_LOAD_IMAGE_UNCHANGED)
-                    
-                    if (!pic.empty()) {
-                        Log.i(TAG, "Immagine decodificata con successo usando MatOfByte")
-                        
-                        // Ruota l'immagine
-                        Core.rotate(pic, pic, Core.ROTATE_90_CLOCKWISE)
-                        matOfByte.release()
-                        
-                        // Rileva i bordi e procedi
-                        detectEdge(pic)
-                        emitter.onNext(Unit)
-                        emitter.onComplete()
-                        return@create
+                    FileOutputStream(pictureFile).use { fos ->
+                        fos.write(p0)
+                        fos.flush()
                     }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Errore durante la decodifica con MatOfByte: ${e.message}", e)
-                    // Continuiamo con il metodo alternativo
-                }
-                
-                // Opzione 2: Carica l'immagine dal file salvato
-                try {
-                    val pic = Imgcodecs.imread(pictureFile.absolutePath)
                     
-                    if (!pic.empty()) {
-                        Log.i(TAG, "Immagine caricata con successo dal file")
-                        
-                        // Ruota l'immagine
-                        Core.rotate(pic, pic, Core.ROTATE_90_CLOCKWISE)
-                        
-                        // Rileva i bordi e procedi
-                        detectEdge(pic)
-                        emitter.onNext(Unit)
-                        emitter.onComplete()
-                        return@create
+                    Log.i(TAG, "Immagine salvata direttamente su file: ${pictureFile.absolutePath}")
+                    
+                    // Verifica che il file sia stato creato e abbia una dimensione valida
+                    if (!pictureFile.exists() || pictureFile.length() < 100) {
+                        throw IOException("File non valido o troppo piccolo: ${pictureFile.length()} bytes")
                     }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Errore durante il caricamento dal file: ${e.message}", e)
-                    // Continuiamo con il metodo alternativo
-                }
-                
-                // Opzione 3: Utilizzo di ByteBuffer con Mat
-                try {
-                    val buffer = ByteBuffer.allocateDirect(p0.size)
-                    buffer.put(p0)
-                    buffer.position(0)
                     
-                    val mat = Mat(1, p0.size, CvType.CV_8UC1)
-                    mat.put(0, 0, p0)
-                    
-                    val pic = Imgcodecs.imdecode(mat, Imgcodecs.CV_LOAD_IMAGE_UNCHANGED)
-                    mat.release()
-                    
-                    if (!pic.empty()) {
-                        Log.i(TAG, "Immagine decodificata con successo usando ByteBuffer")
-                        
-                        // Ruota l'immagine
-                        Core.rotate(pic, pic, Core.ROTATE_90_CLOCKWISE)
-                        
-                        // Rileva i bordi e procedi
-                        detectEdge(pic)
-                        emitter.onNext(Unit)
-                        emitter.onComplete()
-                        return@create
+                    // Carica l'immagine come bitmap usando le API Android (evitando OpenCV)
+                    val options = BitmapFactory.Options().apply {
+                        inPreferredConfig = Bitmap.Config.ARGB_8888
                     }
+                    val bitmap = BitmapFactory.decodeFile(pictureFile.absolutePath, options)
+                    
+                    if (bitmap == null) {
+                        throw IOException("Impossibile decodificare l'immagine come bitmap")
+                    }
+                    
+                    Log.i(TAG, "Bitmap creato con successo: ${bitmap.width}x${bitmap.height}")
+                    
+                    // Converti il bitmap in Mat per il processing
+                    val mat = Mat()
+                    Utils.bitmapToMat(bitmap, mat)
+                    bitmap.recycle()
+                    
+                    if (mat.empty()) {
+                        throw IOException("Conversione da bitmap a Mat fallita")
+                    }
+                    
+                    // Ruota l'immagine se necessario (su alcuni dispositivi potrebbe essere già ruotata)
+                    Core.rotate(mat, mat, Core.ROTATE_90_CLOCKWISE)
+                    
+                    // Rileva i bordi e procedi con il crop
+                    detectEdge(mat)
+                    emitter.onNext(Unit)
+                    emitter.onComplete()
                 } catch (e: Exception) {
-                    Log.e(TAG, "Errore durante la decodifica con ByteBuffer: ${e.message}", e)
+                    Log.e(TAG, "Errore durante il salvataggio o l'elaborazione dell'immagine: ${e.message}", e)
+                    emitter.onError(e)
                 }
-                
-                // Se tutti i metodi falliscono, lanciamo un errore
-                throw IOException("Impossibile decodificare l'immagine con nessun metodo")
-                
             } catch (e: Exception) {
-                Log.e(TAG, "Errore durante l'elaborazione dell'immagine", e)
+                Log.e(TAG, "Errore generico: ${e.message}", e)
                 emitter.onError(e)
             }
         }
@@ -451,7 +432,7 @@ class ScanPresenter constructor(
             },
             // Errore
             { error ->
-                Log.e(TAG, "Errore nell'elaborazione dell'immagine", error)
+                Log.e(TAG, "Errore nell'elaborazione dell'immagine: ${error.message}", error)
                 showError("Impossibile elaborare l'immagine: ${error.localizedMessage ?: "Errore sconosciuto"}")
                 shutted = true
                 busy = false
