@@ -1,6 +1,7 @@
 group 'com.sample.edgedetection'
 version '1.0-SNAPSHOT'
-namespace 'com.sample.edgedetection'
+// Rimuovere questa riga che causa l'errore
+// namespace 'com.sample.edgedetection'
 
 buildscript {
     ext.kotlin_version = '1.8.0'
@@ -28,7 +29,7 @@ apply plugin: 'kotlin-android'
 
 android {
     compileSdkVersion 33
-    namespace 'com.sample.edgedetection'
+    namespace 'com.sample.edgedetection'  // Mantieni questa definizione del namespace
     
     // Aggiornato a Java 11 per compatibilità con Gradle 8.0+
     compileOptions {
